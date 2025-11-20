@@ -1,13 +1,13 @@
 import os
-from typing import List, Dict, Any
-from fastapi import FastAPI, HTTPException
+from typing import List, Dict, Any, Optional
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from schemas import Order, OrderItem, MenuItem
 from database import create_document, get_documents, db
 
-app = FastAPI(title="RTU Canteen API", version="1.0.0")
+app = FastAPI(title="RTU Canteen API", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -133,6 +133,78 @@ def list_orders():
         return {"orders": docs}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+# --- SMS Notifications (Twilio) ---
+class SMSOrdersRequest(BaseModel):
+    phone: Optional[str] = None  # E.164 format preferred (e.g. +919166585401)
+    limit: int = 10
+
+class SMSOrdersResponse(BaseModel):
+    sent: bool
+    to: str
+    message_sid: Optional[str] = None
+    preview: str
+
+
+def _format_orders_sms(orders: List[Dict[str, Any]]) -> str:
+    if not orders:
+        return "RTU Canteen: No recent orders."
+    lines: List[str] = ["RTU Canteen Orders:"]
+    total_sum = 0.0
+    for i, o in enumerate(orders[:10], start=1):
+        name = o.get("customer_name", "?")
+        total = o.get("total", 0)
+        total_sum += float(total or 0)
+        items = o.get("items", [])
+        # Build short items string: Tea×2, Patties×1
+        short_items = ", ".join([f"{it.get('name','')}×{it.get('quantity',1)}" for it in items][:3])
+        lines.append(f"{i}. {name} - ₹{int(round(total))} ({short_items})")
+    lines.append(f"Total Orders: {len(orders)} | Sum: ₹{int(round(total_sum))}")
+    txt = "\n".join(lines)
+    # SMS length safety
+    return (txt[:157] + "…") if len(txt) > 160 else txt
+
+@app.post("/api/notify/orders", response_model=SMSOrdersResponse)
+def sms_recent_orders(payload: SMSOrdersRequest):
+    try:
+        docs = get_documents("order", limit=payload.limit or 10)
+        for d in docs:
+            d["_id"] = str(d.get("_id"))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+    text = _format_orders_sms(docs)
+
+    # Resolve phone number
+    target_phone = payload.phone or os.getenv("NOTIFY_PHONE")
+    if not target_phone:
+        raise HTTPException(status_code=400, detail="Target phone not provided and NOTIFY_PHONE not set")
+
+    # Twilio credentials
+    account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+    auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+    from_number = os.getenv("TWILIO_FROM_NUMBER")
+
+    if not (account_sid and auth_token and from_number):
+        # If creds missing, return preview without sending
+        return SMSOrdersResponse(sent=False, to=target_phone, preview=text)
+
+    try:
+        from twilio.rest import Client  # type: ignore
+        client = Client(account_sid, auth_token)
+        msg = client.messages.create(body=text, from_=from_number, to=target_phone)
+        return SMSOrdersResponse(sent=True, to=target_phone, message_sid=getattr(msg, 'sid', None), preview=text)
+    except Exception as e:
+        # Surface error but include preview for visibility
+        raise HTTPException(status_code=500, detail=f"SMS send failed: {str(e)}")
+
+# Browser-friendly GET wrapper so you can trigger from a link
+@app.get("/api/notify/orders")
+def sms_recent_orders_get(phone: Optional[str] = Query(default=None, description="E.164 number e.g. +919166585401"), limit: int = 10):
+    payload = SMSOrdersRequest(phone=phone, limit=limit)
+    # Reuse the same logic by calling the function directly
+    resp = sms_recent_orders(payload)  # type: ignore
+    return resp
 
 @app.get("/test")
 def test_database():
