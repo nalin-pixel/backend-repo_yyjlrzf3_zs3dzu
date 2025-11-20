@@ -1,5 +1,5 @@
 import os
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Literal
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -134,10 +134,11 @@ def list_orders():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-# --- SMS Notifications (Twilio) ---
+# --- Notifications (Twilio SMS/WhatsApp) ---
 class SMSOrdersRequest(BaseModel):
-    phone: Optional[str] = None  # E.164 format preferred (e.g. +919166585401)
+    phone: Optional[str] = None  # E.164 format preferred (e.g. +9191666585401)
     limit: int = 10
+    channel: Literal['sms', 'whatsapp'] = 'sms'
 
 class SMSOrdersResponse(BaseModel):
     sent: bool
@@ -164,8 +165,20 @@ def _format_orders_sms(orders: List[Dict[str, Any]]) -> str:
     # SMS length safety
     return (txt[:157] + "…") if len(txt) > 160 else txt
 
+
+def _normalize_phone(phone: Optional[str]) -> Optional[str]:
+    if not phone:
+        return phone
+    p = phone.strip()
+    if p.startswith("+"):
+        return p
+    # Assume India country code if not provided
+    if len(p) == 10 and p.isdigit():
+        return "+91" + p
+    return p
+
 @app.post("/api/notify/orders", response_model=SMSOrdersResponse)
-def sms_recent_orders(payload: SMSOrdersRequest):
+def notify_recent_orders(payload: SMSOrdersRequest):
     try:
         docs = get_documents("order", limit=payload.limit or 10)
         for d in docs:
@@ -176,34 +189,46 @@ def sms_recent_orders(payload: SMSOrdersRequest):
     text = _format_orders_sms(docs)
 
     # Resolve phone number
-    target_phone = payload.phone or os.getenv("NOTIFY_PHONE")
+    target_phone = _normalize_phone(payload.phone or os.getenv("NOTIFY_PHONE"))
     if not target_phone:
         raise HTTPException(status_code=400, detail="Target phone not provided and NOTIFY_PHONE not set")
 
     # Twilio credentials
     account_sid = os.getenv("TWILIO_ACCOUNT_SID")
     auth_token = os.getenv("TWILIO_AUTH_TOKEN")
-    from_number = os.getenv("TWILIO_FROM_NUMBER")
+    from_number_sms = os.getenv("TWILIO_FROM_NUMBER")
+    from_number_wa = os.getenv("TWILIO_WHATSAPP_FROM", "")
 
-    if not (account_sid and auth_token and from_number):
-        # If creds missing, return preview without sending
-        return SMSOrdersResponse(sent=False, to=target_phone, preview=text)
+    # If creds missing, return preview without sending
+    if not (account_sid and auth_token and (from_number_sms or from_number_wa)):
+        return SMSOrdersResponse(sent=False, to=target_phone if payload.channel=='sms' else f"whatsapp:{target_phone}", preview=text)
 
     try:
         from twilio.rest import Client  # type: ignore
         client = Client(account_sid, auth_token)
-        msg = client.messages.create(body=text, from_=from_number, to=target_phone)
-        return SMSOrdersResponse(sent=True, to=target_phone, message_sid=getattr(msg, 'sid', None), preview=text)
+        if payload.channel == 'whatsapp':
+            from_id = from_number_wa or (f"whatsapp:{from_number_sms}" if from_number_sms else "")
+            to_id = f"whatsapp:{target_phone}"
+            if not from_id:
+                return SMSOrdersResponse(sent=False, to=to_id, preview=text)
+            msg = client.messages.create(body=text, from_=from_id, to=to_id)
+        else:
+            if not from_number_sms:
+                return SMSOrdersResponse(sent=False, to=target_phone, preview=text)
+            msg = client.messages.create(body=text, from_=from_number_sms, to=target_phone)
+        return SMSOrdersResponse(sent=True, to=(to_id if payload.channel=='whatsapp' else target_phone), message_sid=getattr(msg, 'sid', None), preview=text)
     except Exception as e:
-        # Surface error but include preview for visibility
-        raise HTTPException(status_code=500, detail=f"SMS send failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Notification send failed: {str(e)}")
 
 # Browser-friendly GET wrapper so you can trigger from a link
 @app.get("/api/notify/orders")
-def sms_recent_orders_get(phone: Optional[str] = Query(default=None, description="E.164 number e.g. +919166585401"), limit: int = 10):
-    payload = SMSOrdersRequest(phone=phone, limit=limit)
-    # Reuse the same logic by calling the function directly
-    resp = sms_recent_orders(payload)  # type: ignore
+def notify_recent_orders_get(
+    phone: Optional[str] = Query(default=None, description="E.164 number e.g. +9191666585401 or 10-digit for India"),
+    limit: int = 10,
+    channel: Literal['sms', 'whatsapp'] = 'sms',
+):
+    payload = SMSOrdersRequest(phone=phone, limit=limit, channel=channel)
+    resp = notify_recent_orders(payload)  # type: ignore
     return resp
 
 @app.get("/test")
